@@ -1,0 +1,1 @@
+var e=`/assets/grooming-hero-CcLzC8Mu.jpg`;export{e as t};

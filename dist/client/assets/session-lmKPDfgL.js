@@ -1,0 +1,1 @@
+import{n as e}from"./supabase-CvDWKoSD.js";async function t(){let{data:t}=await e.auth.getSession();return t.session?.access_token??null}export{t};

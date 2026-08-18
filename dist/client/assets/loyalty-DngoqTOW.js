@@ -1,0 +1,1 @@
+function e(e){return 50}function t(e){return Math.max(0,e?.loyalty_points??0)}function n(e){return e<100?0:Math.floor(e/100)*10}function r(e){return Math.floor(Math.max(0,e)/10)*100}function i(e,t){return Math.min(n(e),Math.max(0,Math.floor(t/10)*10))}export{n as a,t as i,i as n,r,e as t};
