@@ -1,0 +1,14 @@
+[build]
+  command = "npm run build"
+  publish = "dist/client"
+
+[build.environment]
+  NODE_VERSION = "22"
+  NPM_FLAGS = "--no-fund --no-audit"
+
+# Set these in Netlify UI → Site settings → Environment variables:
+# VITE_SUPABASE_URL
+# VITE_SUPABASE_ANON_KEY (or VITE_SUPABASE_PUBLISHABLE_KEY)
+# SUPABASE_URL
+# SUPABASE_SECRET_KEY
+# Do NOT add SUPABASE_SECRET_KEY as a VITE_ variable.
