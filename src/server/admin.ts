@@ -1,0 +1,409 @@
+import { createServerFn } from "@tanstack/react-start";
+import { writeAuditLog } from "@/server/audit";
+import {
+  requirePermissionFromToken,
+  resolveStaffFromAccessToken,
+  type AdminSession,
+} from "@/server/admin-auth";
+import {
+  ALL_PERMISSIONS,
+  STAFF_ROLES,
+  isStaffRole,
+  matrixFromRoleMap,
+  roleMapFromMatrix,
+  type AdminPermission,
+  type StaffRole,
+} from "@/lib/admin/roles";
+import { isAdminOrderStatus } from "@/lib/admin/order-status";
+import type { Profile } from "@/types/database";
+
+export type { AdminSession };
+
+export const getAdminSession = createServerFn({ method: "POST" })
+  .inputValidator((data: { accessToken: string }) => data)
+  .handler(async ({ data }): Promise<AdminSession> => {
+    const { session } = await resolveStaffFromAccessToken(data.accessToken);
+    return session;
+  });
+
+export const getAdminDashboardStats = createServerFn({ method: "POST" })
+  .inputValidator((data: { accessToken: string }) => data)
+  .handler(async ({ data }) => {
+    const { admin } = await requirePermissionFromToken(data.accessToken, "dashboard");
+
+    const [{ count: ordersCount }, { count: usersCount }, { data: recentOrders }] =
+      await Promise.all([
+        admin.from("orders").select("*", { count: "exact", head: true }),
+        admin.from("profiles").select("*", { count: "exact", head: true }).eq("role", "customer"),
+        admin
+          .from("orders")
+          .select("id, total, status, created_at, shipping_name")
+          .order("created_at", { ascending: false })
+          .limit(8),
+      ]);
+
+    const { data: allTotals } = await admin.from("orders").select("total, status");
+    const revenue = (allTotals ?? [])
+      .filter((o) => o.status !== "Cancelled")
+      .reduce((sum, o) => sum + Number(o.total ?? 0), 0);
+    const processing = (allTotals ?? []).filter((o) => o.status === "Processing").length;
+
+    return {
+      ordersCount: ordersCount ?? 0,
+      usersCount: usersCount ?? 0,
+      revenue,
+      processing,
+      recentOrders: recentOrders ?? [],
+    };
+  });
+
+export const listAdminOrders = createServerFn({ method: "POST" })
+  .inputValidator((data: { accessToken: string; status?: string }) => data)
+  .handler(async ({ data }) => {
+    const { admin } = await requirePermissionFromToken(data.accessToken, "orders.read");
+    let query = admin
+      .from("orders")
+      .select("*")
+      .order("created_at", { ascending: false })
+      .limit(100);
+
+    if (data.status && data.status !== "all") {
+      query = query.eq("status", data.status);
+    }
+
+    const { data: orders, error } = await query;
+    if (error) throw error;
+    return orders ?? [];
+  });
+
+export const getAdminOrder = createServerFn({ method: "POST" })
+  .inputValidator((data: { accessToken: string; orderId: string }) => data)
+  .handler(async ({ data }) => {
+    const { admin } = await requirePermissionFromToken(data.accessToken, "orders.read");
+
+    const { data: order, error } = await admin
+      .from("orders")
+      .select("*")
+      .eq("id", data.orderId)
+      .maybeSingle();
+    if (error) throw error;
+    if (!order) throw new Error("Order not found");
+
+    const { data: items, error: itemsError } = await admin
+      .from("order_items")
+      .select("*")
+      .eq("order_id", data.orderId);
+    if (itemsError) throw itemsError;
+
+    const { data: profile } = await admin
+      .from("profiles")
+      .select("*")
+      .eq("id", order.user_id)
+      .maybeSingle();
+
+    return { order, items: items ?? [], customer: profile as Profile | null };
+  });
+
+export const updateAdminOrderStatus = createServerFn({ method: "POST" })
+  .inputValidator((data: { accessToken: string; orderId: string; status: string }) => data)
+  .handler(async ({ data }) => {
+    const { session, admin } = await requirePermissionFromToken(data.accessToken, "orders.write");
+
+    if (!isAdminOrderStatus(data.status)) {
+      throw new Error("Invalid order status");
+    }
+
+    const { data: order, error } = await admin
+      .from("orders")
+      .update({ status: data.status })
+      .eq("id", data.orderId)
+      .select("*")
+      .single();
+    if (error) throw error;
+
+    await writeAuditLog({
+      session,
+      action: "order.status_update",
+      entityType: "order",
+      entityId: data.orderId,
+      details: { status: data.status },
+    });
+
+    return order;
+  });
+
+export const listAdminUsers = createServerFn({ method: "POST" })
+  .inputValidator((data: { accessToken: string }) => data)
+  .handler(async ({ data }) => {
+    const { admin } = await requirePermissionFromToken(data.accessToken, "users.read");
+    const { data: users, error } = await admin
+      .from("profiles")
+      .select("*")
+      .order("created_at", { ascending: false })
+      .limit(200);
+    if (error) throw error;
+    return users ?? [];
+  });
+
+export const getAdminUser = createServerFn({ method: "POST" })
+  .inputValidator((data: { accessToken: string; userId: string }) => data)
+  .handler(async ({ data }) => {
+    const { admin } = await requirePermissionFromToken(data.accessToken, "users.read");
+
+    const { data: profile, error } = await admin
+      .from("profiles")
+      .select("*")
+      .eq("id", data.userId)
+      .maybeSingle();
+    if (error) throw error;
+    if (!profile) throw new Error("User not found");
+
+    const [{ data: addresses }, { data: orders }] = await Promise.all([
+      admin.from("addresses").select("*").eq("user_id", data.userId).order("created_at", {
+        ascending: false,
+      }),
+      admin
+        .from("orders")
+        .select("*")
+        .eq("user_id", data.userId)
+        .order("created_at", { ascending: false })
+        .limit(50),
+    ]);
+
+    return {
+      profile,
+      addresses: addresses ?? [],
+      orders: orders ?? [],
+    };
+  });
+
+async function assertCustomerProfile(
+  admin: { from: (table: string) => any },
+  userId: string,
+) {
+  const { data: profile, error } = await admin
+    .from("profiles")
+    .select("*")
+    .eq("id", userId)
+    .maybeSingle();
+  if (error) throw error;
+  if (!profile) throw new Error("User not found");
+  if (profile.role === "super_admin") {
+    throw new Error("super_admin accounts cannot be edited or deleted");
+  }
+  if (profile.role !== "customer") {
+    throw new Error("Only customer accounts can be edited or deleted here. Use Staff for staff roles.");
+  }
+  return profile;
+}
+
+export const updateAdminCustomer = createServerFn({ method: "POST" })
+  .inputValidator(
+    (data: {
+      accessToken: string;
+      userId: string;
+      name: string;
+      phone: string;
+      loyalty_points: number;
+    }) => data,
+  )
+  .handler(async ({ data }) => {
+    const { session, admin } = await requirePermissionFromToken(data.accessToken, "users.write");
+    await assertCustomerProfile(admin, data.userId);
+
+    const loyalty = Math.max(0, Math.floor(Number(data.loyalty_points) || 0));
+    const { data: updated, error } = await admin
+      .from("profiles")
+      .update({
+        name: data.name.trim(),
+        phone: data.phone.trim(),
+        loyalty_points: loyalty,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", data.userId)
+      .eq("role", "customer")
+      .select("*")
+      .single();
+    if (error) throw error;
+
+    await writeAuditLog({
+      session,
+      action: "user.update",
+      entityType: "profile",
+      entityId: data.userId,
+      details: { name: data.name.trim(), phone: data.phone.trim(), loyalty_points: loyalty },
+    });
+
+    return updated;
+  });
+
+export const deleteAdminCustomer = createServerFn({ method: "POST" })
+  .inputValidator((data: { accessToken: string; userId: string }) => data)
+  .handler(async ({ data }) => {
+    const { session, admin } = await requirePermissionFromToken(data.accessToken, "users.write");
+    if (data.userId === session.userId) {
+      throw new Error("You cannot delete your own account");
+    }
+
+    const profile = await assertCustomerProfile(admin, data.userId);
+
+    const { error: authError } = await admin.auth.admin.deleteUser(data.userId);
+    if (authError) {
+      const { error: profileError } = await admin
+        .from("profiles")
+        .delete()
+        .eq("id", data.userId)
+        .eq("role", "customer");
+      if (profileError) throw authError;
+    }
+
+    await writeAuditLog({
+      session,
+      action: "user.delete",
+      entityType: "profile",
+      entityId: data.userId,
+      details: { email: profile.email, name: profile.name },
+    });
+
+    return { ok: true as const, userId: data.userId };
+  });
+
+export const listAdminStaff = createServerFn({ method: "POST" })
+  .inputValidator((data: { accessToken: string }) => data)
+  .handler(async ({ data }) => {
+    const { admin } = await requirePermissionFromToken(data.accessToken, "staff.manage");
+    const { data: staff, error } = await admin
+      .from("profiles")
+      .select("*")
+      .in("role", [...STAFF_ROLES])
+      .order("created_at", { ascending: false });
+    if (error) throw error;
+    return staff ?? [];
+  });
+
+export const updateAdminStaff = createServerFn({ method: "POST" })
+  .inputValidator(
+    (data: {
+      accessToken: string;
+      userId: string;
+      role: string;
+      is_active: boolean;
+    }) => data,
+  )
+  .handler(async ({ data }) => {
+    const { session, admin } = await requirePermissionFromToken(data.accessToken, "staff.manage");
+
+    if (data.userId === session.userId && data.role !== "super_admin") {
+      throw new Error("You cannot demote your own super_admin account");
+    }
+    if (data.userId === session.userId && !data.is_active) {
+      throw new Error("You cannot deactivate your own account");
+    }
+
+    const { data: updated, error } = await admin
+      .from("profiles")
+      .update({
+        role: data.role,
+        is_active: data.is_active,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", data.userId)
+      .select("*")
+      .single();
+    if (error) throw error;
+
+    await writeAuditLog({
+      session,
+      action: "staff.update",
+      entityType: "profile",
+      entityId: data.userId,
+      details: { role: data.role, is_active: data.is_active },
+    });
+
+    return updated;
+  });
+
+export const promoteUserByEmail = createServerFn({ method: "POST" })
+  .inputValidator(
+    (data: { accessToken: string; email: string; role: StaffRole }) => data,
+  )
+  .handler(async ({ data }) => {
+    const { session, admin } = await requirePermissionFromToken(data.accessToken, "staff.manage");
+    if (!isStaffRole(data.role)) throw new Error("Invalid staff role");
+
+    const email = data.email.trim().toLowerCase();
+    const { data: profile, error: findError } = await admin
+      .from("profiles")
+      .select("*")
+      .ilike("email", email)
+      .maybeSingle();
+    if (findError) throw findError;
+    if (!profile) {
+      throw new Error("No profile found for that email. Ask them to sign up on the store first.");
+    }
+
+    const { data: updated, error } = await admin
+      .from("profiles")
+      .update({
+        role: data.role,
+        is_active: true,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", profile.id)
+      .select("*")
+      .single();
+    if (error) throw error;
+
+    await writeAuditLog({
+      session,
+      action: "staff.promote",
+      entityType: "profile",
+      entityId: profile.id,
+      details: { email, role: data.role },
+    });
+
+    return updated;
+  });
+
+export const getPermissionsMatrix = createServerFn({ method: "POST" })
+  .inputValidator((data: { accessToken: string }) => data)
+  .handler(async ({ data }) => {
+    const { overrides } = await requirePermissionFromToken(data.accessToken, "permissions.manage");
+    return matrixFromRoleMap(overrides);
+  });
+
+export const savePermissionsMatrix = createServerFn({ method: "POST" })
+  .inputValidator(
+    (data: {
+      accessToken: string;
+      matrix: Record<StaffRole, Record<AdminPermission, boolean>>;
+    }) => data,
+  )
+  .handler(async ({ data }) => {
+    const { session, admin } = await requirePermissionFromToken(
+      data.accessToken,
+      "permissions.manage",
+    );
+    const roleMap = roleMapFromMatrix(data.matrix);
+
+    const rows = STAFF_ROLES.flatMap((role) =>
+      ALL_PERMISSIONS.map((permission) => ({
+        role,
+        permission,
+        allowed: roleMap[role].includes(permission),
+      })),
+    );
+
+    const { error } = await admin.from("role_permissions").upsert(rows, {
+      onConflict: "role,permission",
+    });
+    if (error) throw error;
+
+    await writeAuditLog({
+      session,
+      action: "permissions.save",
+      entityType: "role_permissions",
+    });
+
+    return matrixFromRoleMap(roleMap);
+  });
